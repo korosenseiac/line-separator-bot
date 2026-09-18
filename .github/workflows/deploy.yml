@@ -1,0 +1,43 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy bot to VPS via SSH
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script_stop: true
+          script: |
+            echo "==> Deploying Telegram Video Line Separator Bot..."
+            cd /opt/line-separator-bot
+
+            # Pull latest changes from git
+            echo "==> Pulling latest updates from GitHub..."
+            git fetch origin main || git fetch origin master
+            git reset --hard origin/$(git branch --show-current)
+
+            # Update Python dependencies
+            echo "==> Updating Python dependencies..."
+            /opt/line-separator-bot/venv/bin/pip install -r requirements.txt
+
+            # Restart systemd service
+            echo "==> Restarting line-separator-bot service..."
+            sudo systemctl restart line-separator-bot
+
+            # Verify service is active
+            sleep 2
+            sudo systemctl is-active line-separator-bot
+            echo "==> Deployment completed successfully! Bot is active."

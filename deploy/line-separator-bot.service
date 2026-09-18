@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Video Line Separator Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/line-separator-bot
+ExecStart=/opt/line-separator-bot/venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/line-separator-bot/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
