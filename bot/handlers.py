@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set
 
 from telegram import ChatMember, Message, Update
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from bot.config import config
@@ -102,6 +102,103 @@ async def is_user_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
         return False
 
 
+# ==============================================================================
+# Safe Telegram API wrappers
+# ==============================================================================
+
+async def _send_separator(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a single separator line. Logs (instead of raising) on failure."""
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        logger.error(f"Error sending separator in chat {chat_id}: {e}")
+
+
+async def _delete_message(
+    chat_id: int,
+    message_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    """Delete a message, returning True only if Telegram confirmed the deletion."""
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except BadRequest as e:
+        logger.warning(
+            f"Cannot delete message {message_id} in chat {chat_id} ({e.message}). "
+            "Ensure the bot is Admin with the 'Delete Messages' permission."
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"Unexpected error deleting message {message_id} in chat {chat_id}: {e}")
+        return False
+
+
+async def _copy_message(
+    chat_id: int,
+    message_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> Optional[int]:
+    """Repost (copy) a message into the same chat, returning the new message ID.
+
+    Telegram can only copy a message that still exists, so this MUST always be
+    called *before* the source message is deleted.
+    """
+    try:
+        copied = await context.bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=chat_id,
+            message_id=message_id,
+        )
+        return copied.message_id
+    except Exception as e:
+        logger.error(f"Could not repost message {message_id} in chat {chat_id}: {e}")
+        return None
+
+
+async def _copy_media_group(
+    chat_id: int,
+    message_ids: List[int],
+    context: ContextTypes.DEFAULT_TYPE,
+) -> List[int]:
+    """Repost an album, returning the message IDs of the copies actually created."""
+    if hasattr(context.bot, "copy_messages"):
+        try:
+            copied = await context.bot.copy_messages(
+                chat_id=chat_id,
+                from_chat_id=chat_id,
+                message_ids=message_ids,
+            )
+            return [item.message_id for item in copied]
+        except Exception as e:
+            logger.warning(
+                f"Batch album repost failed in chat {chat_id} ({e}). "
+                "Falling back to copying the album one message at a time."
+            )
+
+    copied_ids: List[int] = []
+    for message_id in message_ids:
+        new_id = await _copy_message(chat_id, message_id, context)
+        if new_id is not None:
+            copied_ids.append(new_id)
+    return copied_ids
+
+
+async def _can_delete_messages(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check if the bot is allowed to delete other members' messages in this chat."""
+    try:
+        member = await context.bot.get_chat_member(chat_id, context.bot.id)
+    except Exception as e:
+        logger.warning(f"Could not verify bot permissions in chat {chat_id}: {e}")
+        return False
+
+    if member.status == ChatMember.OWNER:
+        return True
+    if member.status == ChatMember.ADMINISTRATOR:
+        return bool(getattr(member, "can_delete_messages", False))
+    return False
+
+
 class MediaGroupCollector:
     """Buffers messages belonging to the same media group (album) and flushes them together."""
 
@@ -158,56 +255,48 @@ async def process_single_video(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Process a standalone video message."""
+    """Process a standalone video message.
+
+    In "repost" mode the video ends up bracketed by separators:
+
+        [top line] -> [reposted video] -> [bottom line]
+
+    The video is reposted *before* the original message is deleted, because
+    Telegram can only copy messages that still exist.
+    """
     top_line, bottom_line = get_active_separators_for_chat(chat_id)
-    bot_mode = config.bot_mode
+    need_top_line = not is_last_separator(chat_id)
 
-    if bot_mode == "repost":
-        # Attempt to delete the original message
-        deleted = False
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message.message_id)
-            deleted = True
-        except BadRequest as e:
-            logger.warning(
-                f"Cannot delete message in chat {chat_id} ({e.message}). "
-                "Ensure bot is Admin with 'Delete Messages' permission. Falling back to append mode."
-            )
-        except Exception as e:
-            logger.warning(f"Unexpected error deleting message in chat {chat_id}: {e}")
-
-        if deleted:
-            # 1. Send Top Separator only if previous was not already a separator
-            if not is_last_separator(chat_id):
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=top_line)
-                except TelegramError as e:
-                    logger.error(f"Error sending top separator: {e}")
-
-            # 2. Copy/repost original video (instantly preserves original quality and caption)
-            try:
-                await context.bot.copy_message(
-                    chat_id=chat_id,
-                    from_chat_id=chat_id,
-                    message_id=message.message_id,
-                )
-            except TelegramError as e:
-                logger.error(f"Error copying video message: {e}")
-
-            # 3. Send Bottom Separator
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=bottom_line)
-                set_last_separator(chat_id, True)
-            except TelegramError as e:
-                logger.error(f"Error sending bottom separator: {e}")
-            return
-
-    # In "append" mode or fallback when message couldn't be deleted:
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=bottom_line)
+    # "append" mode - or "repost" mode without the required admin right - keeps the
+    # original video untouched and only closes it with a bottom line.
+    if config.bot_mode != "repost" or not await _can_delete_messages(chat_id, context):
+        await _send_separator(chat_id, bottom_line, context)
         set_last_separator(chat_id, True)
-    except TelegramError as e:
-        logger.error(f"Error sending bottom separator in append mode: {e}")
+        return
+
+    # 1. Top separator first, so it lands above the reposted video.
+    if need_top_line:
+        await _send_separator(chat_id, top_line, context)
+
+    # 2. Repost the video while the original message still exists.
+    copied_message_id = await _copy_message(chat_id, message.message_id, context)
+
+    if copied_message_id is None:
+        # The video could not be reposted (e.g. protected content). Never delete the
+        # original in that case: keep the video and fall back to appending a line.
+        await _send_separator(chat_id, bottom_line, context)
+        set_last_separator(chat_id, True)
+        return
+
+    # 3. Remove the original only after the repost succeeded.
+    if not await _delete_message(chat_id, message.message_id, context):
+        # Deletion was refused after all: drop our own copy so the video is never
+        # shown twice.
+        await _delete_message(chat_id, copied_message_id, context)
+
+    # 4. Bottom separator.
+    await _send_separator(chat_id, bottom_line, context)
+    set_last_separator(chat_id, True)
 
 
 async def process_media_group(
@@ -215,67 +304,52 @@ async def process_media_group(
     messages: List[Message],
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Process an album of video messages grouped under one separator pair."""
+    """Process an album of video messages grouped inside one separator pair.
+
+    The album is reposted *before* the originals are deleted.
+    """
     top_line, bottom_line = get_active_separators_for_chat(chat_id)
-    bot_mode = config.bot_mode
+    need_top_line = not is_last_separator(chat_id)
     message_ids = [m.message_id for m in messages]
 
-    if bot_mode == "repost":
-        # Attempt to delete original messages
+    # "append" mode - or "repost" mode without the required admin right - keeps the
+    # original album untouched and only closes it with a bottom line.
+    if config.bot_mode != "repost" or not await _can_delete_messages(chat_id, context):
+        await _send_separator(chat_id, bottom_line, context)
+        set_last_separator(chat_id, True)
+        return
+
+    # 1. Top separator first, so it lands above the reposted album.
+    if need_top_line:
+        await _send_separator(chat_id, top_line, context)
+
+    # 2. Repost the album while the original messages still exist.
+    copied_ids = await _copy_media_group(chat_id, message_ids, context)
+
+    if len(copied_ids) == len(message_ids):
+        # 3. Delete the originals only when every album item was reposted.
         all_deleted = True
-        for m in messages:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=m.message_id)
-            except Exception as e:
-                logger.warning(f"Could not delete album item {m.message_id}: {e}")
+        for message_id in message_ids:
+            if not await _delete_message(chat_id, message_id, context):
                 all_deleted = False
 
-        if all_deleted:
-            # 1. Send Top Separator
-            if not is_last_separator(chat_id):
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=top_line)
-                except TelegramError as e:
-                    logger.error(f"Error sending top separator: {e}")
+        if not all_deleted:
+            # Roll the reposted album back so nothing is duplicated.
+            for copied_id in copied_ids:
+                await _delete_message(chat_id, copied_id, context)
+    else:
+        # An incomplete repost would silently drop videos from the album, so keep
+        # the original album and remove the partial copies instead.
+        logger.warning(
+            f"Album repost in chat {chat_id} incomplete "
+            f"({len(copied_ids)}/{len(message_ids)} items copied). Keeping the originals."
+        )
+        for copied_id in copied_ids:
+            await _delete_message(chat_id, copied_id, context)
 
-            # 2. Copy Album messages
-            copied = False
-            if hasattr(context.bot, "copy_messages"):
-                try:
-                    await context.bot.copy_messages(
-                        chat_id=chat_id,
-                        from_chat_id=chat_id,
-                        message_ids=message_ids,
-                    )
-                    copied = True
-                except Exception as e:
-                    logger.debug(f"copy_messages failed, falling back to sequential copy: {e}")
-
-            if not copied:
-                for m in messages:
-                    try:
-                        await context.bot.copy_message(
-                            chat_id=chat_id,
-                            from_chat_id=chat_id,
-                            message_id=m.message_id,
-                        )
-                    except TelegramError as e:
-                        logger.error(f"Error sequentially copying album item {m.message_id}: {e}")
-
-            # 3. Send Bottom Separator
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=bottom_line)
-                set_last_separator(chat_id, True)
-            except TelegramError as e:
-                logger.error(f"Error sending bottom separator: {e}")
-            return
-
-    # In "append" mode or fallback:
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=bottom_line)
-        set_last_separator(chat_id, True)
-    except TelegramError as e:
-        logger.error(f"Error sending album bottom separator in append mode: {e}")
+    # 4. Bottom separator.
+    await _send_separator(chat_id, bottom_line, context)
+    set_last_separator(chat_id, True)
 
 
 # ==============================================================================

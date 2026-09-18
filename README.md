@@ -199,6 +199,21 @@ Every time you push new code or styles to GitHub, GitHub Actions will automatica
 
 ---
 
+## 🩺 Troubleshooting
+
+| Symptom | Cause & Fix |
+| :--- | :--- |
+| **Only separator lines appear and the video disappears** | Fixed in this version. The bot used to delete the video *before* reposting it, so Telegram rejected the copy (`message to copy not found`) and the video was lost. It now reposts the video first and only then deletes the original. Update with `/update` or `sudo update-bot` and restart the service. |
+| **A second copy of the video stays in the chat** | The bot could not delete the original message. Grant it the **Delete Messages** admin right; until then it automatically keeps the original and only adds a line below it. |
+| **The bot adds only the bottom line** | Either `BOT_MODE=append` is set, or the bot is not an admin with **Delete Messages**. In this fallback the video is never deleted, so nothing is lost. |
+| **A forwarded video cannot be reposted at all** | The source content is protected (*Restrict saving content*). Telegram blocks copying for everyone, so the bot keeps the original video and only adds the bottom line. |
+| **The bot ignores videos completely** | Group **privacy mode** is still enabled. Send `/setprivacy` to [@BotFather](https://t.me/BotFather), select the bot and choose **Disable**, then re-add the bot to the group. |
+| **Nothing happens at all** | Promote the bot to **Administrator** (Send Messages + Delete Messages) and check `BOT_MODE=repost` in `.env`, then `sudo systemctl restart line-separator-bot`. |
+
+> 💡 `BOT_MODE=append` is the zero-risk mode: the original video is never deleted, the bot only adds a separator line below it.
+
+---
+
 ## 🐳 Optional: Running with Docker
 
 If you prefer Docker over systemd:
