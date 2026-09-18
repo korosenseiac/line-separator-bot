@@ -36,6 +36,24 @@ def _parse_chat_ids(val: str) -> Set[int]:
     return result
 
 
+def _parse_int(val: Optional[str], default: int, minimum: int = 1) -> int:
+    """Parse an integer env var, falling back to ``default`` and clamping to ``minimum``."""
+    try:
+        parsed = int((val or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def _parse_float(val: Optional[str], default: float, minimum: float = 0.0) -> float:
+    """Parse a float env var, falling back to ``default`` and clamping to ``minimum``."""
+    try:
+        parsed = float((val or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
 @dataclass
 class BotConfig:
     bot_token: str
@@ -50,6 +68,11 @@ class BotConfig:
     include_video_documents: bool = True
     include_video_notes: bool = True
     media_group_debounce_sec: float = 1.2
+    flood_retry_max_attempts: int = 5
+    flood_retry_buffer_sec: float = 1.0
+    max_flood_wait_sec: float = 120.0
+    permission_cache_ttl_sec: float = 300.0
+    min_send_interval_sec: float = 0.0
     log_level: str = "INFO"
 
     @classmethod
@@ -80,6 +103,13 @@ class BotConfig:
         except ValueError:
             debounce_sec = 1.2
 
+        # Flood control (HTTP 429 / RetryAfter) handling
+        flood_retry_max_attempts = _parse_int(os.getenv("FLOOD_RETRY_MAX_ATTEMPTS"), 5, minimum=1)
+        flood_retry_buffer_sec = _parse_float(os.getenv("FLOOD_RETRY_BUFFER_SEC"), 1.0, minimum=0.0)
+        max_flood_wait_sec = _parse_float(os.getenv("MAX_FLOOD_WAIT_SEC"), 120.0, minimum=0.0)
+        permission_cache_ttl_sec = _parse_float(os.getenv("PERMISSION_CACHE_TTL_SEC"), 300.0, minimum=0.0)
+        min_send_interval_sec = _parse_float(os.getenv("MIN_SEND_INTERVAL_SEC"), 0.0, minimum=0.0)
+
         log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
         return cls(
@@ -95,6 +125,11 @@ class BotConfig:
             include_video_documents=include_video_docs,
             include_video_notes=include_video_notes,
             media_group_debounce_sec=debounce_sec,
+            flood_retry_max_attempts=flood_retry_max_attempts,
+            flood_retry_buffer_sec=flood_retry_buffer_sec,
+            max_flood_wait_sec=max_flood_wait_sec,
+            permission_cache_ttl_sec=permission_cache_ttl_sec,
+            min_send_interval_sec=min_send_interval_sec,
             log_level=log_level,
         )
 

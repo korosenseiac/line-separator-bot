@@ -2,11 +2,13 @@
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Set
+import time
+from datetime import timedelta
+from typing import Awaitable, Callable, Dict, List, Optional, Set
 
 from telegram import ChatMember, Message, Update
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import ContextTypes
 
 from bot.config import config
@@ -106,12 +108,136 @@ async def is_user_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
 # Safe Telegram API wrappers
 # ==============================================================================
 
-async def _send_separator(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a single separator line. Logs (instead of raising) on failure."""
+# ------------------------------------------------------------------------------
+# Flood control (HTTP 429 / RetryAfter) handling, call pacing & permission cache
+# ------------------------------------------------------------------------------
+
+# chat_id -> monotonic() deadline until which Telegram asked us to wait
+_flood_until: Dict[int, float] = {}
+# chat_id -> monotonic() timestamp of our last paced (outgoing message) API call
+_last_call_at: Dict[int, float] = {}
+# chat_id -> (monotonic() expiry, can_delete_messages)
+_permission_cache: Dict[int, tuple] = {}
+
+
+def _retry_after_seconds(error: RetryAfter) -> float:
+    """Return the delay requested by a ``RetryAfter`` error as float seconds."""
+    retry_after = error.retry_after
+    if isinstance(retry_after, timedelta):
+        return max(0.0, retry_after.total_seconds())
     try:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+        return max(0.0, float(retry_after))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _await_flood_window(chat_id: int) -> None:
+    """Sleep until a known flood-control window for this chat has expired.
+
+    A Telegram 429 response states exactly how long the bot must wait. That
+    deadline is remembered per chat, so a retried call - and every following call
+    in the same chat - waits it out instead of triggering another 429 (and
+    another error log) straight away. Other chats are never delayed.
+    """
+    while True:
+        remaining = _flood_until.get(chat_id, 0.0) - time.monotonic()
+        if remaining <= 0:
+            return
+        logger.info(
+            f"Telegram flood control: waiting {remaining:.1f}s before the next API call "
+            f"in chat {chat_id}..."
+        )
+        await asyncio.sleep(remaining)
+
+
+async def _await_send_pacing(chat_id: int) -> None:
+    """Proactively space out our own outgoing messages for this chat (optional)."""
+    interval = config.min_send_interval_sec
+    if interval <= 0:
+        return
+
+    elapsed = time.monotonic() - _last_call_at.get(chat_id, 0.0)
+    remaining = interval - elapsed
+    if remaining > 0:
+        logger.debug(f"Pacing API calls in chat {chat_id}: sleeping {remaining:.2f}s")
+        await asyncio.sleep(remaining)
+
+
+async def _call_api(
+    chat_id: int,
+    description: str,
+    request: Callable[[], Awaitable],
+    pace: bool = True,
+):
+    """Run a Telegram API call, honouring ``RetryAfter`` instead of dropping it.
+
+    ``request`` must be a zero-argument callable returning a fresh coroutine, so
+    every retry issues a real new request. Only HTTP 429 is retried: Telegram
+    rejected that request outright, so re-issuing it can never duplicate a post.
+    Other errors are raised unchanged, preserving the existing copy-before-delete
+    guarantees.
+    """
+    attempts = max(1, config.flood_retry_max_attempts)
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        await _await_flood_window(chat_id)
+        if pace:
+            await _await_send_pacing(chat_id)
+            _last_call_at[chat_id] = time.monotonic()
+
+        try:
+            return await request()
+        except RetryAfter as e:
+            wait = _retry_after_seconds(e) + config.flood_retry_buffer_sec
+            last_error = e
+
+            # An extreme wait is not worth blocking the whole bot for: give up on this
+            # call (the caller falls back) instead of registering the window.
+            if wait > config.max_flood_wait_sec:
+                logger.error(
+                    f"{description} in chat {chat_id} was flood-limited for {wait:.0f}s, which "
+                    f"exceeds MAX_FLOOD_WAIT_SEC={config.max_flood_wait_sec:.0f}: giving up "
+                    f"(attempt {attempt}/{attempts})."
+                )
+                break
+
+            # Remember the window so every following call in this chat waits as well.
+            _flood_until[chat_id] = time.monotonic() + wait
+
+            if attempt >= attempts:
+                logger.error(
+                    f"{description} in chat {chat_id} is still flood-limited after "
+                    f"{attempt}/{attempts} attempt(s) (asked to wait {wait:.0f}s): {e}"
+                )
+                break
+
+            logger.warning(
+                f"Telegram flood control on {description} in chat {chat_id}: waiting "
+                f"{wait:.0f}s before retrying (attempt {attempt + 1}/{attempts})"
+            )
+            await asyncio.sleep(wait)
+        except Exception as e:  # non-flood errors keep the previous behaviour
+            last_error = e
+            break
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"{description} failed in chat {chat_id} for an unknown reason")
+
+
+async def _send_separator(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Send a single separator line. Returns True only when it was delivered."""
+    try:
+        await _call_api(
+            chat_id,
+            "sending a separator",
+            lambda: context.bot.send_message(chat_id=chat_id, text=text),
+        )
+        return True
     except Exception as e:
         logger.error(f"Error sending separator in chat {chat_id}: {e}")
+        return False
 
 
 async def _delete_message(
@@ -121,7 +247,11 @@ async def _delete_message(
 ) -> bool:
     """Delete a message, returning True only if Telegram confirmed the deletion."""
     try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await _call_api(
+            chat_id,
+            f"deleting message {message_id}",
+            lambda: context.bot.delete_message(chat_id=chat_id, message_id=message_id),
+        )
         return True
     except BadRequest as e:
         logger.warning(
@@ -145,10 +275,14 @@ async def _copy_message(
     called *before* the source message is deleted.
     """
     try:
-        copied = await context.bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=chat_id,
-            message_id=message_id,
+        copied = await _call_api(
+            chat_id,
+            f"reposting message {message_id}",
+            lambda: context.bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=chat_id,
+                message_id=message_id,
+            ),
         )
         return copied.message_id
     except Exception as e:
@@ -164,10 +298,14 @@ async def _copy_media_group(
     """Repost an album, returning the message IDs of the copies actually created."""
     if hasattr(context.bot, "copy_messages"):
         try:
-            copied = await context.bot.copy_messages(
-                chat_id=chat_id,
-                from_chat_id=chat_id,
-                message_ids=message_ids,
+            copied = await _call_api(
+                chat_id,
+                f"reposting album {message_ids}",
+                lambda: context.bot.copy_messages(
+                    chat_id=chat_id,
+                    from_chat_id=chat_id,
+                    message_ids=message_ids,
+                ),
             )
             return [item.message_id for item in copied]
         except Exception as e:
@@ -185,18 +323,40 @@ async def _copy_media_group(
 
 
 async def _can_delete_messages(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Check if the bot is allowed to delete other members' messages in this chat."""
+    """Check if the bot is allowed to delete other members' messages in this chat.
+
+    The answer is cached per chat for ``PERMISSION_CACHE_TTL_SEC`` seconds so a
+    burst of videos does not spend one ``get_chat_member`` call per video. Set the
+    TTL to ``0`` to always ask Telegram.
+    """
+    ttl = config.permission_cache_ttl_sec
+    if ttl > 0:
+        cached = _permission_cache.get(chat_id)
+        if cached is not None and cached[0] > time.monotonic():
+            return cached[1]
+
     try:
-        member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        member = await _call_api(
+            chat_id,
+            "checking the bot's permissions",
+            lambda: context.bot.get_chat_member(chat_id, context.bot.id),
+            pace=False,
+        )
     except Exception as e:
         logger.warning(f"Could not verify bot permissions in chat {chat_id}: {e}")
         return False
 
     if member.status == ChatMember.OWNER:
-        return True
-    if member.status == ChatMember.ADMINISTRATOR:
-        return bool(getattr(member, "can_delete_messages", False))
-    return False
+        can_delete = True
+    elif member.status == ChatMember.ADMINISTRATOR:
+        can_delete = bool(getattr(member, "can_delete_messages", False))
+    else:
+        can_delete = False
+
+    if ttl > 0:
+        _permission_cache[chat_id] = (time.monotonic() + ttl, can_delete)
+
+    return can_delete
 
 
 class MediaGroupCollector:
@@ -270,8 +430,8 @@ async def process_single_video(
     # "append" mode - or "repost" mode without the required admin right - keeps the
     # original video untouched and only closes it with a bottom line.
     if config.bot_mode != "repost" or not await _can_delete_messages(chat_id, context):
-        await _send_separator(chat_id, bottom_line, context)
-        set_last_separator(chat_id, True)
+        delivered = await _send_separator(chat_id, bottom_line, context)
+        set_last_separator(chat_id, delivered)
         return
 
     # 1. Top separator first, so it lands above the reposted video.
@@ -284,8 +444,8 @@ async def process_single_video(
     if copied_message_id is None:
         # The video could not be reposted (e.g. protected content). Never delete the
         # original in that case: keep the video and fall back to appending a line.
-        await _send_separator(chat_id, bottom_line, context)
-        set_last_separator(chat_id, True)
+        delivered = await _send_separator(chat_id, bottom_line, context)
+        set_last_separator(chat_id, delivered)
         return
 
     # 3. Remove the original only after the repost succeeded.
@@ -294,9 +454,11 @@ async def process_single_video(
         # shown twice.
         await _delete_message(chat_id, copied_message_id, context)
 
-    # 4. Bottom separator.
-    await _send_separator(chat_id, bottom_line, context)
-    set_last_separator(chat_id, True)
+    # 4. Bottom separator. A chat only counts as "closed" when a separator really
+    #    landed last, so a flood-control failure cannot swallow the next video's
+    #    top line.
+    delivered = await _send_separator(chat_id, bottom_line, context)
+    set_last_separator(chat_id, delivered)
 
 
 async def process_media_group(
@@ -315,8 +477,8 @@ async def process_media_group(
     # "append" mode - or "repost" mode without the required admin right - keeps the
     # original album untouched and only closes it with a bottom line.
     if config.bot_mode != "repost" or not await _can_delete_messages(chat_id, context):
-        await _send_separator(chat_id, bottom_line, context)
-        set_last_separator(chat_id, True)
+        delivered = await _send_separator(chat_id, bottom_line, context)
+        set_last_separator(chat_id, delivered)
         return
 
     # 1. Top separator first, so it lands above the reposted album.
@@ -347,9 +509,11 @@ async def process_media_group(
         for copied_id in copied_ids:
             await _delete_message(chat_id, copied_id, context)
 
-    # 4. Bottom separator.
-    await _send_separator(chat_id, bottom_line, context)
-    set_last_separator(chat_id, True)
+    # 4. Bottom separator. A chat only counts as "closed" when a separator really
+    #    landed last, so a flood-control failure cannot swallow the next album's
+    #    top line.
+    delivered = await _send_separator(chat_id, bottom_line, context)
+    set_last_separator(chat_id, delivered)
 
 
 # ==============================================================================

@@ -23,6 +23,7 @@ Videos are forwarded or uploaded to your group...
 - **🚀 1-Click VPS Installer**: Automated bash script sets up Python, dependencies, and `systemd` background service in under 60 seconds.
 - **🔄 Keep Running 24/7**: Configured as a Linux `systemd` service that keeps running even after you exit your SSH terminal, and auto-restarts on server reboot or crashes.
 - **⚡ Automated CI/CD**: Push updates to GitHub, and GitHub Actions automatically updates and restarts the bot on your VPS with zero downtime.
+- **🛡️ Flood-Control Safe**: When Telegram rate-limits a group (`429 Too Many Requests`) after a burst of forwards, the bot waits the exact requested time and retries, so separators never stop mid-batch.
 
 ---
 
@@ -184,6 +185,11 @@ Every time you push new code or styles to GitHub, GitHub Actions will automatica
 | `INCLUDE_VIDEO_DOCUMENTS`| `true` | Include video files sent as documents (.mp4, .mkv, etc.) |
 | `INCLUDE_VIDEO_NOTES` | `true` | Include round video bubble notes |
 | `MEDIA_GROUP_DEBOUNCE_SEC`| `1.2` | Seconds to wait to group multiple album videos together |
+| `FLOOD_RETRY_MAX_ATTEMPTS` | `5` | How many times a call is retried after Telegram answers `429 Too Many Requests` |
+| `FLOOD_RETRY_BUFFER_SEC` | `1.0` | Extra safety seconds added to Telegram's requested retry delay |
+| `MAX_FLOOD_WAIT_SEC` | `120` | Give up (and fall back) instead of waiting longer than this for flood control |
+| `PERMISSION_CACHE_TTL_SEC` | `300` | Seconds to cache the bot's "Delete Messages" permission per chat (`0` = always ask Telegram) |
+| `MIN_SEND_INTERVAL_SEC` | `0` | Optional minimum delay between the bot's own messages in a chat (`0` = disabled) |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
 ---
@@ -203,6 +209,7 @@ Every time you push new code or styles to GitHub, GitHub Actions will automatica
 
 | Symptom | Cause & Fix |
 | :--- | :--- |
+| **The bot stops adding separators after ~10 forwarded videos** | Telegram rate-limited the group (`HTTP 429` / *Flood control exceeded*). The bot now waits the requested `RetryAfter` and retries instead of dropping the video, so a long burst keeps working. Tune it with `FLOOD_RETRY_MAX_ATTEMPTS`, `FLOOD_RETRY_BUFFER_SEC` and `MAX_FLOOD_WAIT_SEC`; if it still happens, spread the forwards out or set `MIN_SEND_INTERVAL_SEC` to slow the bot's own posting down. |
 | **Only separator lines appear and the video disappears** | Fixed in this version. The bot used to delete the video *before* reposting it, so Telegram rejected the copy (`message to copy not found`) and the video was lost. It now reposts the video first and only then deletes the original. Update with `/update` or `sudo update-bot` and restart the service. |
 | **A second copy of the video stays in the chat** | The bot could not delete the original message. Grant it the **Delete Messages** admin right; until then it automatically keeps the original and only adds a line below it. |
 | **The bot adds only the bottom line** | Either `BOT_MODE=append` is set, or the bot is not an admin with **Delete Messages**. In this fallback the video is never deleted, so nothing is lost. |
