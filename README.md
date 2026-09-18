@@ -62,7 +62,7 @@ Connect to your VPS via SSH and run the following command:
 
 ### If cloning from your GitHub repository:
 ```bash
-git clone https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git /opt/line-separator-bot
+git clone https://github.com/korosenseiac/line-separator-bot.git /opt/line-separator-bot
 cd /opt/line-separator-bot
 sudo bash install.sh
 ```
